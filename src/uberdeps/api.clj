@@ -2,11 +2,13 @@
   (:require
    [clojure.string :as str]
    [clojure.java.io :as io]
-   [clojure.tools.deps.alpha :as deps])
+   [clojure.tools.deps.alpha :as deps]
+   [clojure.tools.deps.alpha.util.dir :as deps.dir])
   (:import
    [java.io File InputStream FileInputStream FileOutputStream BufferedInputStream BufferedOutputStream]
-   [java.util.jar JarEntry JarInputStream JarOutputStream]
-   [java.nio.file.attribute FileTime]))
+   [java.nio.file.attribute FileTime]
+   [java.time Instant]
+   [java.util.jar JarEntry JarInputStream JarOutputStream]))
 
 
 (set! *warn-on-reflection* true)
@@ -53,6 +55,10 @@
         (.closeEntry out)
         (swap! *seen-files assoc path context)))))
 
+(defn- copy-stream-filtered [^InputStream in ^String path last-modified ^JarOutputStream out]
+  (when-not (some #(re-matches % path) exclusions)
+    (copy-stream in path last-modified out)))
+
 
 (defn copy-directory [^File dir out]
   (let [dir-path  (.getPath dir)
@@ -62,7 +68,7 @@
       (with-open [in (io/input-stream file)]
         (let [rel-path (-> (.getPath file) (subs (count dir-path')))
               modified (FileTime/fromMillis (.lastModified file))]
-        (copy-stream in rel-path modified out))))))
+         (copy-stream-filtered in rel-path modified out))))))
 
 
 (defn copy-jar [^File file out]
@@ -70,12 +76,13 @@
     (loop [entry (.getNextEntry in)]
       (when (some? entry)
         (when-not (.isDirectory entry)
-          (copy-stream in (.getName entry) (.getLastModifiedTime entry) out))
+          (copy-stream-filtered in (.getName entry) (.getLastModifiedTime entry) out))
         (recur (.getNextEntry in))))))
 
 
 (defn package* [path out]
-  (let [file (io/file path)]
+  (let [file (io/file path)
+        file (if (.isAbsolute file) file (io/file deps.dir/*the-dir* file))]
     (cond
       (not (.exists file))
       :skip
@@ -108,8 +115,20 @@
           (package-lib lib' coord' lib-map out))))))
 
 
+(defn package-manifest
+  [opts out]
+  (when-some [main-class (:main-class opts)]
+    (let [manifest (str "Manifest-Version: 1.0\n"
+                     (format "Created-By: %s (%s)\n" (System/getProperty "java.version") (System/getProperty "java.vm.vendor"))
+                     (format "Main-Class: %s\n" main-class))
+          in       (io/input-stream (.getBytes manifest))]
+      (copy-stream in "META-INF/MANIFEST.MF" (FileTime/from (Instant/now)) out))))
+
+
 (defn package-libs [deps-map out]
-  (let [lib-map (->> (deps/resolve-deps deps-map (:args-map deps-map))
+  (let [lib-map (->>
+                  (deps/resolve-deps deps-map (:args-map deps-map))
+                  (remove (fn [[_ deps-map]] (contains? deps-map :extension))) ;; remove non-jar deps (https://github.com/tonsky/uberdeps/issues/14 https://github.com/tonsky/uberdeps/pull/15)
                   (into (sorted-map)))]
     (doseq [[lib coord] lib-map
             :when (nil? (:dependents coord))] ; roots
@@ -138,6 +157,7 @@
        (when-let [p (.getParentFile (io/file target))]
          (.mkdirs p))
        (with-open [out (JarOutputStream. (BufferedOutputStream. (FileOutputStream. target)))]
+         (package-manifest opts out)
          (package-paths deps-map out)
          (package-libs deps-map out)))
      (when (#{:debug :info} level)
